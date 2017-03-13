@@ -858,6 +858,81 @@ bool RegisterAllocatorLinearScan::TrySplitNonPairOrUnalignedPairIntervalAt(size_
   return false;
 }
 
+// Process (split/spill, update register allocator lists) active interval which has the register
+// the current interval has.
+void RegisterAllocatorLinearScan::ProcessActiveHoldingReg(ArenaVector<LiveInterval*>::iterator it,
+    LiveInterval* current) {
+  LiveInterval* active = *it;
+  DCHECK_EQ(active->GetRegister(), current->GetRegister());
+  DCHECK(!active->IsFixed());
+  size_t last_use_pos = active->LastUseBefore(current->GetStart());
+  // An interval should be at least 1 position long.
+  size_t after_last_use_pos = active->GetStart() ? last_use_pos + 1 : last_use_pos;
+  LiveInterval* split = nullptr;
+  // At "current->GetStart()" position an active interval AI_orig should be spilled. Instead of
+  // splitting and spilling at this exact position we try to find an earlier split point
+  // which is more beneficial. Then after splitting the active interval (AI_orig -> AI_1 + AI_2)
+  // two cases are possible (V - is "current->GetStart()", x - register use):
+  //
+  //   1. the second part AI_2 has no register uses:
+  //     - we can safely spill it.
+  //                 V
+  //        |....x...............|      AI_orig
+  //
+  //                 V
+  //        |....x|                     AI_1
+  //              |..............|      AI_2 - spilled
+  //
+  //   2. the second part AI_2 has some register uses:
+  //     - we have to split again (AI_2 -> AI_2_1 + AI_2_2): the middle part AI_2_1 will be
+  //       spilled, the third one AI_2_2 will be inserted into unhandled_ set.
+  //                 V
+  //        |....x........x......|      AI_orig
+  //
+  //                 V
+  //        |....x|                     AI_1
+  //              |......|              AI_2_1 - spilled
+  //                     |x......|      AI_2_2 - added to unhandled_
+  //
+  //     - Though we get an interval AI_2_1 with a start position less than the current position we
+  //       don't add it to any sets, immediately process it and never backtrack. So the start
+  //       position of the current in LinearScan loop current->GetStart() never declines.
+  if (after_last_use_pos >= current->GetStart()) {
+    // Default case.
+    split = Split(active, current->GetStart());
+    AddSorted(unhandled_, split);
+  } else {
+    // Optimized case.
+    split = SplitBetween(active, after_last_use_pos, current->GetStart());
+
+    if (split->GetStart() == current->GetStart()) {
+      AddSorted(unhandled_, split);
+    } else {
+      LiveInterval* split2 = nullptr;
+      size_t first_reg_use = split->FirstRegisterUse();
+      DCHECK_EQ(split->FirstRegisterUseAfter(after_last_use_pos), first_reg_use);
+      if (split->FirstRegisterUse() != kNoLifetime) {
+        // In order to get an interval that can be spilled we should split the original one
+        // BEFORE its first register use.
+        size_t split_pos = first_reg_use - 1;
+        DCHECK_GE(split_pos, current->GetStart());
+        split2 = Split(split, split_pos);
+        AddSorted(unhandled_, split2);
+      }
+
+      DCHECK(!split->HasRegister());
+      DCHECK(split->FirstRegisterUse() == kNoLifetime);
+      // To spill a pair interval we need to spill its LowInterval; high one will be processed
+      // automatically.
+      AllocateSpillSlotFor(active->IsHighInterval() ? split->GetLowInterval() : split);
+    }
+  }
+  if (split != active) {
+    handled_.push_back(active);
+  }
+  RemoveIntervalAndPotentialOtherHalf(&active_, it);
+}
+
 // Find the register that is used the last, and spill the interval
 // that holds it. If the first use of `current` is after that register
 // we spill `current` instead.
@@ -990,13 +1065,7 @@ bool RegisterAllocatorLinearScan::AllocateBlockedReg(LiveInterval* current) {
     for (auto it = active_.begin(), end = active_.end(); it != end; ++it) {
       LiveInterval* active = *it;
       if (active->GetRegister() == reg) {
-        DCHECK(!active->IsFixed());
-        LiveInterval* split = Split(active, current->GetStart());
-        if (split != active) {
-          handled_.push_back(active);
-        }
-        RemoveIntervalAndPotentialOtherHalf(&active_, it);
-        AddSorted(unhandled_, split);
+        ProcessActiveHoldingReg(it, current);
         break;
       }
     }

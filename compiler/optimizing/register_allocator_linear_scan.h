@@ -104,6 +104,7 @@ class RegisterAllocatorLinearScan : public RegisterAllocator {
   bool TrySplitNonPairOrUnalignedPairIntervalAt(size_t position,
                                                 size_t first_register_use,
                                                 size_t* next_use);
+  void ProcessActiveHoldingReg(ArenaVector<LiveInterval*>::iterator it, LiveInterval* current);
 
   // List of intervals for core registers that must be processed, ordered by start
   // position. Last entry is the interval that has the lowest start position.
